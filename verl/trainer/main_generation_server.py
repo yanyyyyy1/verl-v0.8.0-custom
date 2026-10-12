@@ -21,6 +21,7 @@ import aiohttp
 import hydra
 import numpy as np
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -60,8 +61,24 @@ async def start_server(config):
     assert len(server_handles) == num_replicas
     assert len(server_addresses) == num_replicas
 
-    return server_handles, server_addresses
+    return rollout_servers, server_handles, server_addresses
 
+@ray.remote(num_cpus=0.1)
+class GenerationServerController:
+    def __init__(self):
+        self.rollout_servers = []
+        self.server_handles = []
+        self.server_addresses = []
+
+    async def start(self, config):
+
+        (
+            self.rollout_servers,
+            self.server_handles,
+            self.server_addresses,
+        ) = await start_server(config)
+
+        return self.server_addresses
 
 async def submit_request(server_address, **chat_complete_request):
     try:
@@ -158,8 +175,27 @@ def main(config):
     chat_lst = [chat.tolist() for chat in chat_lst]
     chat_numpy = np.array(chat_lst)
 
-    # start native server
-    server_handles, server_addresses = asyncio.run(start_server(config))
+    # 找到具有 NPU 资源的 Ray 节点
+    npu_nodes = [
+        node for node in ray.nodes()
+        if node["Alive"] and node["Resources"].get("NPU", 0) > 0
+    ]
+
+    if not npu_nodes:
+        raise RuntimeError("No available NPU Ray nodes found")
+
+    # 将 Controller 固定到有 NPU 的 Worker 节点
+    node_id = npu_nodes[0]["NodeID"]
+
+    controller = GenerationServerController.options(
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=node_id,
+            soft=False,
+        )
+    ).remote()
+
+    # 在 Worker 上启动推理服务
+    server_addresses = ray.get(controller.start.remote(config))
 
     # run generate
     gen_results = asyncio.run(
